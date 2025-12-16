@@ -5,23 +5,21 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# REPLACE <YOUR_USERNAME> with your actual linux username (e.g., ubuntu, pi, root)
+# User and Group inferred from your prompt 'pi@pbrscada'
 User=pi
-# REPLACE <YOUR_GROUP> with your actual group (usually same as username)
 Group=pi
 
-# IMPORTANT: Set this to the absolute path of the directory containing flake.nix and config.json
-WorkingDirectory=/home/<YOUR_USERNAME>/path/to/api_to_mqtt
+# WorkingDirectory inferred from your prompt '~/api_to_mqtt'
+WorkingDirectory=/home/pi/api_to_mqtt
 
-# This command enters the nix dev environment and runs the python script
-# We add --extra-experimental-features to ensure flakes work if not globally enabled
-ExecStart=/usr/bin/nix develop --extra-experimental-features 'nix-command flakes' --command python3 api_to_mqtt.py
+# Updated ExecStart with the specific path you provided
+ExecStart=/nix/var/nix/profiles/default/bin/nix develop --extra-experimental-features 'nix-command flakes' --command python3 api_to_mqtt.py
 
 # Restart policy to keep the service running if it crashes
 Restart=always
 RestartSec=10
 
-# Environment variables if needed (e.g. for buffering)
+# Environment variables if needed
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
