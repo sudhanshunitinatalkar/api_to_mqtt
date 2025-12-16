@@ -14,7 +14,7 @@ LOG_FILENAME = "api_to_mqtt.log"
 LOG_LOCK = threading.Lock() # Lock for thread-safe file writing
 
 # --- NEW: CONFIGURATION FOR LOG LIMIT ---
-MAX_LOG_LINES = 100 
+MAX_LOG_LINES = 1000 
 
 # API Endpoints
 LOGIN_URL = "https://airquality.aqi.in/api/v1/login"
