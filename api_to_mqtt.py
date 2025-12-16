@@ -10,9 +10,11 @@ import paho.mqtt.client as mqtt
 # --- GLOBAL SETTINGS ---
 # ==========================================
 CONFIG_FILENAME = "config.json"
-# Changed to use a .log file
 LOG_FILENAME = "api_to_mqtt.log"
 LOG_LOCK = threading.Lock() # Lock for thread-safe file writing
+
+# --- NEW: CONFIGURATION FOR LOG LIMIT ---
+MAX_LOG_LINES = 100 
 
 # API Endpoints
 LOGIN_URL = "https://airquality.aqi.in/api/v1/login"
@@ -29,7 +31,9 @@ def load_config():
         print(f"CRITICAL ERROR: Could not parse {CONFIG_FILENAME}. {e}")
         return []
 
-# New detailed logging function
+# ==========================================
+# --- MODIFIED LOGGING FUNCTION ---
+# ==========================================
 def log_event(job_name, event_type, details, payload=None):
     with LOG_LOCK:
         try:
@@ -40,21 +44,36 @@ def log_event(job_name, event_type, details, payload=None):
             # Append payload details if available
             if payload is not None:
                 if isinstance(payload, dict) or isinstance(payload, list):
-                    # Use json.dumps for structured logging of API data
                     payload_str = json.dumps(payload, indent=4)
                 else:
-                    # For MQTT payload (which is a string) or other simple data
                     payload_str = str(payload)
                 
-                log_entry += f"\n--- PAYLOAD ---\n{payload_str}\n----------------\n"
+                log_entry += f"\n--- PAYLOAD ---\n{payload_str}\n----------------"
 
-            with open(LOG_FILENAME, mode='a', encoding='utf-8') as file:
-                file.write(log_entry + "\n")
+            # 1. Read existing lines
+            lines = []
+            if os.path.exists(LOG_FILENAME):
+                with open(LOG_FILENAME, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+
+            # 2. Append new entry (ensure it has a newline)
+            lines.append(log_entry + "\n")
+
+            # 3. Trim to keep only the last MAX_LOG_LINES
+            if len(lines) > MAX_LOG_LINES:
+                lines = lines[-MAX_LOG_LINES:]
+
+            # 4. Write back to file (Overwrite mode 'w')
+            with open(LOG_FILENAME, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
             
         except Exception as e:
+            # Fallback print to console if file IO fails
             print(f"[{job_name}] Logging Error: {e}")
 
-
+# ==========================================
+# --- AUTH & API FUNCTIONS ---
+# ==========================================
 def get_api_token(email, password, job_name):
     try:
         # 1. Log Login Request Payload (password is redacted)
@@ -66,7 +85,11 @@ def get_api_token(email, password, job_name):
         response = requests.post(LOGIN_URL, data=original_payload, timeout=15)
         
         # 2. Log Login Response Payload
-        response_json = response.json()
+        try:
+            response_json = response.json()
+        except:
+            response_json = "Non-JSON Response"
+
         log_event(job_name, "API_LOGIN_RESPONSE", f"Status: {response.status_code}", response_json)
         
         if response.status_code == 200:
@@ -171,8 +194,7 @@ def run_job(job_config):
                         keyword = map_rule.get('device_keyword', '*') # Default to * if missing
                         mqtt_conf = map_rule.get('mqtt', {})
                         
-                        # --- MATCH LOGIC UPDATED ---
-                        # If keyword is "*" OR it matches the Name OR it matches the Serial Number
+                        # Match Logic
                         is_match = (keyword == "*") or (keyword in dev_name) or (keyword in dev_sn)
                         
                         if is_match:
@@ -180,11 +202,9 @@ def run_job(job_config):
                             if payload:
                                 success = publish_mqtt(payload, mqtt_conf, name)
                                 if success:
-                                    # 3. Log MQTT Publish Payload on success
                                     details = f"Device: {dev_name} ({dev_sn}) -> Topic: {mqtt_conf.get('topic')}"
                                     log_event(name, "MQTT_PUBLISH_SUCCESS", details, payload)
                                 else:
-                                    # Log MQTT Failure
                                     details = f"Device: {dev_name} ({dev_sn}) -> FAILED to publish to {mqtt_conf.get('broker')}"
                                     log_event(name, "MQTT_PUBLISH_FAILURE", details, payload)
                             else:
@@ -192,7 +212,6 @@ def run_job(job_config):
                                 log_event(name, "DATA_FORMAT_ERROR", f"Failed to format data for device: {dev_name} ({dev_sn})", device)
             else:
                 print(f"[{name}] API Error: {response.status_code}")
-                # API error response is already logged above with the general device fetch response
                 
         except json.JSONDecodeError:
             print(f"[{name}] API Error: Received non-JSON response.")
@@ -211,6 +230,7 @@ def run_job(job_config):
 
 def main():
     print("--- Multi-Broker / Multi-Account Gateway ---")
+    print(f"--- Logging enabled: Keeping last {MAX_LOG_LINES} lines ---")
     config = load_config()
     if not config: return
 
