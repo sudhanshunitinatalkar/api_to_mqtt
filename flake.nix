@@ -23,17 +23,8 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               python312
-              python312Packages.requests
               python312Packages.paho-mqtt
-              python312Packages.pymodbus
-              python312Packages.pyserial
-              python312Packages.jsonschema
-              python312Packages.pycryptodome
-              python312Packages.cryptography
-              python312Packages.flask
-              python312Packages.rplcd
-              python312Packages.netifaces
-              python312Packages.smbus2
+              python312Packages.requests
               mosquitto
             ];
           };

@@ -1,204 +1,232 @@
 import requests
 import json
 import time
-import csv
 import os
+import threading
 from datetime import datetime
 import paho.mqtt.client as mqtt
 
 # ==========================================
-# --- USER CONFIGURATION ---
+# --- GLOBAL SETTINGS ---
 # ==========================================
-
-# 1. TIMING
-# How often to run the loop (in seconds)
-PUBLISH_INTERVAL = 10
-
-# 2. LOGGING
-CSV_FILENAME = "api_mqtt_log.csv"
-
-# 3. API CREDENTIALS (AQI.in)
-API_EMAIL = "purchaseacres@bhoomi-group.com"     
-API_PASSWORD = "Nimu1015"
-
-# 4. MQTT BROKER DETAILS
-MQTT_BROKER = "cloud.pbrresearch.com"
-MQTT_PORT = 1883 
-MQTT_USER = "317060018"
-MQTT_PASS = "317060018"
-MQTT_TOPIC = "test/display_1"
-
-# ==========================================
-# --- END CONFIGURATION ---
-# ==========================================
+CONFIG_FILENAME = "config.json"
+# Changed to use a .log file
+LOG_FILENAME = "api_to_mqtt.log"
+LOG_LOCK = threading.Lock() # Lock for thread-safe file writing
 
 # API Endpoints
 LOGIN_URL = "https://airquality.aqi.in/api/v1/login"
 DEVICE_URL = "https://airquality.aqi.in/api/v1/GetAllUserDevices"
 
-def get_api_token():
-    """
-    Logs in to the API and retrieves the Bearer token.
-    """
+def load_config():
+    if not os.path.exists(CONFIG_FILENAME):
+        print(f"CRITICAL ERROR: {CONFIG_FILENAME} not found.")
+        return []
     try:
-        payload = {'email': API_EMAIL, 'password': API_PASSWORD}
-        print(f"Authentication: Requesting new token from {LOGIN_URL}...")
+        with open(CONFIG_FILENAME, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"CRITICAL ERROR: Could not parse {CONFIG_FILENAME}. {e}")
+        return []
+
+# New detailed logging function
+def log_event(job_name, event_type, details, payload=None):
+    with LOG_LOCK:
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Build the main log line
+            log_entry = f"[{timestamp}] [{job_name}] {event_type} | {details}"
+            
+            # Append payload details if available
+            if payload is not None:
+                if isinstance(payload, dict) or isinstance(payload, list):
+                    # Use json.dumps for structured logging of API data
+                    payload_str = json.dumps(payload, indent=4)
+                else:
+                    # For MQTT payload (which is a string) or other simple data
+                    payload_str = str(payload)
+                
+                log_entry += f"\n--- PAYLOAD ---\n{payload_str}\n----------------\n"
+
+            with open(LOG_FILENAME, mode='a', encoding='utf-8') as file:
+                file.write(log_entry + "\n")
+            
+        except Exception as e:
+            print(f"[{job_name}] Logging Error: {e}")
+
+
+def get_api_token(email, password, job_name):
+    try:
+        # 1. Log Login Request Payload (password is redacted)
+        request_payload_log = {'email': email, 'password': '***REDACTED***'}
+        log_event(job_name, "API_LOGIN_REQUEST", f"URL: {LOGIN_URL}", request_payload_log)
+
+        # Use original payload for the actual API call
+        original_payload = {'email': email, 'password': password}
+        response = requests.post(LOGIN_URL, data=original_payload, timeout=15)
         
-        response = requests.post(LOGIN_URL, data=payload)
+        # 2. Log Login Response Payload
+        response_json = response.json()
+        log_event(job_name, "API_LOGIN_RESPONSE", f"Status: {response.status_code}", response_json)
         
         if response.status_code == 200:
             data = response.json()
             if 'token' in data:
-                print("Authentication: Success.")
+                print(f"[{job_name}] Auth Success.")
                 return data['token']
-            else:
-                print("Authentication: Token missing in response.")
-        else:
-            print(f"Authentication Failed: {response.status_code}")
-            
+        print(f"[{job_name}] Auth Failed: {response.status_code}")
     except Exception as e:
-        print(f"Authentication Error: {e}")
+        print(f"[{job_name}] Auth Error: {e}")
+        log_event(job_name, "AUTH_ERROR_EXCEPTION", str(e))
     return None
 
-def append_to_csv(request_info, raw_response, mqtt_payload):
-    """
-    Appends a new row to the CSV file.
-    """
-    file_exists = os.path.isfile(CSV_FILENAME)
-    
+def format_mqtt_string(device_data):
     try:
-        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            
-            # Write Header if new file
-            if not file_exists:
-                writer.writerow(["Timestamp", "Request_Details", "Raw_API_Response_JSON", "MQTT_Payload"])
-            
-            # Create timestamp
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Dump dictionary to string for CSV storage
-            if isinstance(raw_response, (dict, list)):
-                raw_response_str = json.dumps(raw_response)
-            else:
-                raw_response_str = str(raw_response)
-
-            writer.writerow([timestamp, request_info, raw_response_str, mqtt_payload])
-            print(f"Logging: Data saved to {CSV_FILENAME}")
-            
-    except Exception as e:
-        print(f"Logging Error: Could not write to CSV - {e}")
-
-def format_mqtt_string(device_json):
-    """
-    Formats the JSON data into the specific string format required.
-    """
-    if not device_json or 'data' not in device_json or not device_json['data']:
-        return None
-
-    # Get first device
-    try:
-        device = device_json['data'][0]
-        realtime_sensors = device.get('realtime', [])
-        
+        realtime_sensors = device_data.get('realtime', [])
         data_parts = []
         for sensor in realtime_sensors:
-            # Clean name: "Temp(cel)" -> "TEMP"
             name = sensor.get('sensorname', 'Unknown').split('(')[0].strip().upper()
             value = sensor.get('sensorvalue', 0)
             data_parts.append(f"{name}:{value}")
 
-        # Add timestamp: DATE:2025-02-13,20:45:28
         now = datetime.now()
         date_str = now.strftime("DATE:%Y-%m-%d,%H:%M:%S")
-        
+        if not data_parts: return None
         return ",".join(data_parts) + "," + date_str
     except Exception as e:
-        print(f"Formatting Error: {e}")
         return None
 
-def publish_mqtt(payload):
-    """
-    Publishes payload to MQTT broker.
-    """
+def publish_mqtt(payload, mqtt_config, job_name):
+    broker = mqtt_config.get('broker')
+    port = mqtt_config.get('port', 1883)
+    user = mqtt_config.get('username')
+    password = mqtt_config.get('password')
+    topic = mqtt_config.get('topic')
+
     client = mqtt.Client()
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
+    if user and password:
+        client.username_pw_set(user, password)
     
     try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.publish(MQTT_TOPIC, payload)
+        client.connect(broker, port, 60)
+        client.publish(topic, payload)
         client.disconnect()
-        print(f"MQTT: Published to {MQTT_TOPIC}")
+        print(f"[{job_name}] -> Sent to {broker} :: {topic}")
         return True
     except Exception as e:
-        print(f"MQTT Error: {e}")
+        print(f"[{job_name}] MQTT Error ({broker}): {e}")
+        log_event(job_name, "MQTT_CONNECT_ERROR", str(e), mqtt_config)
         return False
 
-def main():
+def run_job(job_config):
+    name = job_config.get('job_name', 'Unnamed')
+    interval = job_config.get('interval', 10)
+    api_conf = job_config['api']
+    mappings = job_config.get('device_mappings', [])
+
+    print(f"[{name}] Starting worker thread...")
     token = None
     
-    print(f"--- Starting Service (Interval: {PUBLISH_INTERVAL}s) ---")
-    
     while True:
-        loop_start_time = time.time()
+        loop_start = time.time()
         
-        # 1. Get Token (Login if we don't have one)
+        # 1. Login
         if not token:
-            token = get_api_token()
+            token = get_api_token(api_conf['email'], api_conf['password'], name)
             if not token:
-                print("Error: Could not get token. Retrying in 10s...")
                 time.sleep(10)
                 continue
 
-        # 2. Prepare Request
-        request_details = f"GET {DEVICE_URL}"
-        headers = {'Authorization': f'bearer {token}'}
-
-        # 3. Fetch Data
+        # 2. Fetch Data
         try:
-            print("\nFetching device data...")
-            response = requests.get(DEVICE_URL, headers=headers)
+            headers = {'Authorization': f'bearer {token}'}
+            # Log Device Fetch Request
+            log_event(name, "API_DEVICE_FETCH_REQUEST", f"URL: {DEVICE_URL}")
             
-            # Handle Token Expiry (401 Unauthorized)
+            response = requests.get(DEVICE_URL, headers=headers, timeout=15)
+            
             if response.status_code == 401:
-                print("Token expired. Re-authenticating...")
+                print(f"[{name}] Token expired. Refreshing...")
+                log_event(name, "API_TOKEN_EXPIRED", "Status 401 received.")
                 token = None
                 continue
-            
-            # Handle Success
+                
+            raw_json = response.json()
+            # Log Device Fetch Response
+            log_event(name, "API_DEVICE_FETCH_RESPONSE", f"Status: {response.status_code}", raw_json)
+                
             if response.status_code == 200:
-                raw_json = response.json()
-                
-                # 4. Format Payload
-                mqtt_payload = format_mqtt_string(raw_json)
-                
-                if mqtt_payload:
-                    print(f"Payload generated: {mqtt_payload[:50]}...") 
+                devices_list = raw_json.get('data', [])
+
+                if not devices_list:
+                    print(f"[{name}] No devices found.")
+
+                # 3. Process Mappings
+                for device in devices_list:
+                    dev_name = device.get('devicename', '')
+                    dev_sn = device.get('serialno', '')
                     
-                    # 5. Publish
-                    publish_mqtt(mqtt_payload)
-                    
-                    # 6. Log to CSV
-                    append_to_csv(request_details, raw_json, mqtt_payload)
-                else:
-                    print("Warning: Valid JSON received but no device data found to format.")
-                    append_to_csv(request_details, raw_json, "ERROR: No Data to Format")
+                    # Check every mapping rule
+                    for map_rule in mappings:
+                        keyword = map_rule.get('device_keyword', '*') # Default to * if missing
+                        mqtt_conf = map_rule.get('mqtt', {})
+                        
+                        # --- MATCH LOGIC UPDATED ---
+                        # If keyword is "*" OR it matches the Name OR it matches the Serial Number
+                        is_match = (keyword == "*") or (keyword in dev_name) or (keyword in dev_sn)
+                        
+                        if is_match:
+                            payload = format_mqtt_string(device)
+                            if payload:
+                                success = publish_mqtt(payload, mqtt_conf, name)
+                                if success:
+                                    # 3. Log MQTT Publish Payload on success
+                                    details = f"Device: {dev_name} ({dev_sn}) -> Topic: {mqtt_conf.get('topic')}"
+                                    log_event(name, "MQTT_PUBLISH_SUCCESS", details, payload)
+                                else:
+                                    # Log MQTT Failure
+                                    details = f"Device: {dev_name} ({dev_sn}) -> FAILED to publish to {mqtt_conf.get('broker')}"
+                                    log_event(name, "MQTT_PUBLISH_FAILURE", details, payload)
+                            else:
+                                print(f"[{name}] Data format failed for {dev_name}")
+                                log_event(name, "DATA_FORMAT_ERROR", f"Failed to format data for device: {dev_name} ({dev_sn})", device)
             else:
-                print(f"API Error: {response.status_code} - {response.text}")
-                append_to_csv(request_details, response.text, "ERROR: API Request Failed")
-
+                print(f"[{name}] API Error: {response.status_code}")
+                # API error response is already logged above with the general device fetch response
+                
+        except json.JSONDecodeError:
+            print(f"[{name}] API Error: Received non-JSON response.")
+            log_event(name, "API_RESPONSE_ERROR", f"Received non-JSON response or timeout for URL: {DEVICE_URL}")
+        except requests.exceptions.Timeout:
+            print(f"[{name}] API Error: Request timed out.")
+            log_event(name, "API_TIMEOUT_ERROR", f"Request timed out for URL: {DEVICE_URL}")
         except Exception as e:
-            print(f"Loop Error: {e}")
-            append_to_csv(request_details, str(e), "ERROR: Exception")
+            print(f"[{name}] Loop Exception: {e}")
+            log_event(name, "LOOP_EXCEPTION", f"Unhandled exception in run_job loop: {str(e)}")
+            token = None
 
-        # 7. Sleep for the remainder of the interval
-        elapsed = time.time() - loop_start_time
-        sleep_time = max(0, PUBLISH_INTERVAL - elapsed)
-        print(f"Sleeping for {sleep_time:.1f} seconds...")
+        elapsed = time.time() - loop_start
+        sleep_time = max(0, interval - elapsed)
         time.sleep(sleep_time)
 
-if __name__ == "__main__":
+def main():
+    print("--- Multi-Broker / Multi-Account Gateway ---")
+    config = load_config()
+    if not config: return
+
+    threads = []
+    for job in config:
+        if job.get('enabled', True):
+            t = threading.Thread(target=run_job, args=(job,))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+    print(f"--- Running {len(threads)} jobs simultaneously ---")
     try:
-        main()
+        while True: time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping script...")
+        print("\nStopping...")
+
+if __name__ == "__main__":
+    main()
