@@ -41,7 +41,7 @@ def log_to_file(job_name, log_type, event_type, details, payload=None):
     """
     with LOG_LOCK:
         try:
-            # Create job-specific folder (Option B)
+            # Create job-specific folder
             safe_name = "".join([c for c in job_name if c.isalnum() or c in (' ', '.', '_')]).strip().replace(" ", "_")
             job_dir = os.path.join(LOG_DIR, safe_name)
             if not os.path.exists(job_dir):
@@ -103,19 +103,51 @@ def get_api_token(email, password, job_name):
     return None
 
 def format_mqtt_string(device_data):
+    """
+    Extracts only PM2.5, PM10, TEMP, and HUM from the device data
+    and formats them as KEY:VALUE strings.
+    """
     try:
         realtime_sensors = device_data.get('realtime', [])
-        data_parts = []
-        for sensor in realtime_sensors:
-            name = sensor.get('sensorname', 'Unknown').split('(')[0].strip().upper()
-            value = sensor.get('sensorvalue', 0)
-            data_parts.append(f"{name}:{value}")
+        found_data = {}
 
+        # 1. Extract and normalize available sensor data
+        for sensor in realtime_sensors:
+            # API usually returns names like "PM2.5 (ug/m3)", "Temperature (C)"
+            # We normalize this to just "PM2.5", "TEMPERATURE", etc.
+            raw_name = sensor.get('sensorname', 'Unknown').split('(')[0].strip().upper()
+            value = sensor.get('sensorvalue', 0)
+
+            # Map common API names to your specific target keys
+            if raw_name in ["PM2.5", "PM25"]:
+                found_data["PM25"] = value
+            elif raw_name in ["PM10"]:
+                found_data["PM10"] = value
+            elif raw_name in ["TEMPERATURE", "TEMP"]:
+                found_data["TEMP"] = value
+            elif raw_name in ["HUMIDITY", "HUM"]:
+                found_data["HUM"] = value
+
+        # 2. Construct the data string in the specific order requested
+        target_order = ["PM25", "PM10", "TEMP", "HUM"]
+        data_parts = []
+
+        for key in target_order:
+            if key in found_data:
+                data_parts.append(f"{key}:{found_data[key]}")
+
+        # If none of the relevant sensors were found, return None to skip publishing
+        if not data_parts:
+            return None
+
+        # 3. Add Timestamp
         now = datetime.now()
         date_str = now.strftime("DATE:%Y-%m-%d,%H:%M:%S")
-        if not data_parts: return None
+        
         return ",".join(data_parts) + "," + date_str
-    except:
+
+    except Exception as e:
+        # In case of parsing error, return None
         return None
 
 def publish_mqtt(payload, mqtt_config, job_name):
@@ -125,7 +157,7 @@ def publish_mqtt(payload, mqtt_config, job_name):
     pw = mqtt_config.get('password')
     topic = mqtt_config.get('topic')
 
-    # FIX: Explicitly specify CallbackAPIVersion to remove DeprecationWarning
+    # Explicitly specify CallbackAPIVersion to remove DeprecationWarning
     try:
         client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         if user and pw:
@@ -187,7 +219,7 @@ def run_job(job_config):
                                 else:
                                     log_to_file(name, "error", "MQTT_PUBLISH_FAILURE", f"Failed to send to {mqtt_conf.get('topic')}", payload)
                             else:
-                                log_to_file(name, "error", "FORMAT_ERROR", f"No sensor data for {dev_name}")
+                                log_to_file(name, "error", "FORMAT_ERROR", f"No matching sensor data (PM25, PM10, TEMP, HUM) for {dev_name}")
             
             elif response.status_code == 401:
                 log_to_file(name, "error", "API_TOKEN_EXPIRED", "401 Unauthorized - Re-authenticating...")
